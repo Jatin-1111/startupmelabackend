@@ -19,7 +19,7 @@ export const sendInvoiceEmail = async (ticket) => {
       <h1>Payment Successful!</h1>
       <p>Hi ${ticket.name},</p>
       <p>Your ticket for <strong>${ticket.passType}</strong> is confirmed.</p>
-      <p><strong>Transaction ID:</strong> ${ticket.transactionId}</p>
+      <p><strong>Order ID:</strong> ${ticket.orderId}</p>
       <p><strong>Amount Paid:</strong> ₹${ticket.amount}</p>
       <br/>
       <p>See you at the event!</p>
@@ -31,5 +31,6 @@ export const sendInvoiceEmail = async (ticket) => {
     console.log(`📧 Email sent to ${ticket.email}`);
   } catch (error) {
     console.error('❌ Email failed:', error);
+    throw new Error(`Failed to send email: ${error.message}`);
   }
 };

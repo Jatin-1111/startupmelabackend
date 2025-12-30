@@ -7,21 +7,85 @@ import { sendInvoiceEmail } from '../utils/sendEmails.js';
 const MERCHANT_ID = process.env.PHONEPE_MERCHANT_ID;
 const SALT_KEY = process.env.PHONEPE_SALT_KEY;
 const SALT_INDEX = process.env.PHONEPE_SALT_INDEX;
-const HOST_URL = process.env.PHONEPE_HOST_URL; 
+const HOST_URL = process.env.PHONEPE_HOST_URL;
+const BACKEND_URL = process.env.BACKEND_URL || 'https://startupmelabackend.vercel.app';
+const FRONTEND_URL = process.env.FRONTEND_URL || 'https://startupmela.com';
+
+// Validate environment variables
+if (!MERCHANT_ID || !SALT_KEY || !SALT_INDEX || !HOST_URL) {
+  console.error('❌ Missing PhonePe credentials in environment variables');
+}
 
 // 1. Create Payment Order
 export const createOrder = async (req, res) => {
   try {
     const { name, email, phone, passType, amount, quantity } = req.body;
 
-    // Unique Transaction ID
-    const merchantTransactionId = "MT" + Date.now() + Math.floor(Math.random() * 1000);
+    // Validate required fields
+    if (!name || !email || !phone || !passType || !amount) {
+      return res.status(400).json({
+        success: false,
+        message: 'Missing required fields'
+      });
+    }
+
+    // Validate email format
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailRegex.test(email)) {
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid email format'
+      });
+    }
+
+    // Validate phone format (Indian)
+    const phoneRegex = /^[6-9]\d{9}$/;
+    const cleanPhone = phone.replace(/[\s+\-()]/g, '');
+    if (!phoneRegex.test(cleanPhone.slice(-10))) {
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid phone number'
+      });
+    }
+
+    // Validate amount
+    if (isNaN(amount) || amount <= 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid amount'
+      });
+    }
+
+    // Check for environment variables
+    if (!MERCHANT_ID || !SALT_KEY || !SALT_INDEX || !HOST_URL) {
+      console.error('PhonePe credentials not configured');
+      return res.status(500).json({
+        success: false,
+        message: 'Payment gateway not configured'
+      });
+    }
+
+    // Generate unique Transaction ID with better randomness
+    const merchantTransactionId = `MT${Date.now()}${Math.floor(Math.random() * 10000).toString().padStart(4, '0')}`;
+
+    // Check if order already exists
+    const existingOrder = await Ticket.findOne({ orderId: merchantTransactionId });
+    if (existingOrder) {
+      return res.status(409).json({
+        success: false,
+        message: 'Order ID conflict, please try again'
+      });
+    }
 
     // Save PENDING ticket to Database
     const newTicket = await Ticket.create({
-      name, email, phone, passType, amount, quantity,
-      transactionId: merchantTransactionId,
-      paymentStatus: "PENDING"
+      name,
+      email,
+      phone,
+      passType,
+      amount,
+      orderId: merchantTransactionId,
+      status: "created"
     });
 
     // PhonePe Payload
@@ -30,9 +94,9 @@ export const createOrder = async (req, res) => {
       merchantTransactionId: merchantTransactionId,
       merchantUserId: "MUID" + Date.now(),
       amount: amount * 100, // Convert to paise
-      redirectUrl: `https://startupmelabackend.vercel.app/api/payment/status/${merchantTransactionId}`,
+      redirectUrl: `${BACKEND_URL}/api/payment/status/${merchantTransactionId}`,
       redirectMode: "POST",
-      callbackUrl: `https://startupmelabackend.vercel.app/api/payment/status/${merchantTransactionId}`,
+      callbackUrl: `${BACKEND_URL}/api/payment/status/${merchantTransactionId}`,
       mobileNumber: phone,
       paymentInstrument: { type: "PAY_PAGE" }
     };
@@ -61,17 +125,35 @@ export const createOrder = async (req, res) => {
 
     if (response.data.success) {
       // Send Redirect URL to Frontend
-      res.json({ 
-        success: true, 
-        redirectUrl: response.data.data.instrumentResponse.redirectInfo.url 
+      res.json({
+        success: true,
+        redirectUrl: response.data.data.instrumentResponse.redirectInfo.url,
+        orderId: merchantTransactionId
       });
     } else {
-      res.status(400).json({ success: false, message: "PhonePe Error" });
+      // Delete the pending ticket if PhonePe fails
+      await Ticket.findOneAndDelete({ orderId: merchantTransactionId });
+
+      res.status(400).json({
+        success: false,
+        message: response.data.message || "Payment gateway error"
+      });
     }
 
   } catch (error) {
     console.error("Payment Error:", error.message);
-    res.status(500).json({ success: false, message: "Server Error" });
+
+    // Clean up ticket on error
+    if (error.merchantTransactionId) {
+      await Ticket.findOneAndDelete({ orderId: error.merchantTransactionId });
+    }
+
+    // Provide specific error messages
+    const errorMessage = error.response?.data?.message || error.message || "Payment initialization failed";
+    res.status(500).json({
+      success: false,
+      message: errorMessage
+    });
   }
 };
 
@@ -100,27 +182,53 @@ export const checkStatus = async (req, res) => {
     if (response.data.success && response.data.code === "PAYMENT_SUCCESS") {
       // Update Database
       const ticket = await Ticket.findOneAndUpdate(
-        { transactionId },
-        { paymentStatus: "SUCCESS" },
+        { orderId: transactionId },
+        {
+          status: "paid",
+          paymentId: response.data.data.transactionId,
+          signature: response.data.data.merchantTransactionId
+        },
         { new: true }
       );
 
+      // Check if ticket was found and updated
+      if (!ticket) {
+        console.error(`Ticket not found for orderId: ${transactionId}`);
+        return res.redirect(`${FRONTEND_URL}/payment-failed?error=ticket_not_found`);
+      }
+
       // Send Email
-      if (ticket) sendInvoiceEmail(ticket);
+      try {
+        await sendInvoiceEmail(ticket);
+      } catch (emailError) {
+        console.error("Email sending failed:", emailError.message);
+        // Don't fail the payment if email fails
+      }
 
       // Redirect User to Frontend Success Page
-      res.redirect(`https://startupmela.com/payment-success?id=${transactionId}`);
+      res.redirect(`${FRONTEND_URL}/payment-success?id=${transactionId}`);
     } else {
       // Update DB to Failed
       await Ticket.findOneAndUpdate(
-        { transactionId },
-        { paymentStatus: "FAILED" }
+        { orderId: transactionId },
+        { status: "failed" }
       );
-      res.redirect(`https://startupmela.com/payment-failed`);
+      res.redirect(`${FRONTEND_URL}/payment-failed`);
     }
 
   } catch (error) {
     console.error("Status Check Error:", error.message);
-    res.redirect(`https://startupmela.com/payment-failed`);
+
+    // Try to update ticket status to failed if it exists
+    try {
+      await Ticket.findOneAndUpdate(
+        { orderId: transactionId },
+        { status: "failed" }
+      );
+    } catch (dbError) {
+      console.error("Failed to update ticket status:", dbError.message);
+    }
+
+    res.redirect(`${FRONTEND_URL}/payment-failed?id=${transactionId}`);
   }
 };
