@@ -18,6 +18,8 @@ if (!MERCHANT_ID || !SALT_KEY || !SALT_INDEX || !HOST_URL) {
 
 // 1. Create Payment Order
 export const createOrder = async (req, res) => {
+  let merchantTransactionId = null; // Define outside try block for cleanup access
+
   try {
     const { name, email, phone, passType, amount, quantity } = req.body;
 
@@ -66,7 +68,7 @@ export const createOrder = async (req, res) => {
     }
 
     // Generate unique Transaction ID with better randomness
-    const merchantTransactionId = `MT${Date.now()}${Math.floor(Math.random() * 10000).toString().padStart(4, '0')}`;
+    merchantTransactionId = `MT${Date.now()}${Math.floor(Math.random() * 10000).toString().padStart(4, '0')}`;
 
     // Check if order already exists
     const existingOrder = await Ticket.findOne({ orderId: merchantTransactionId });
@@ -111,6 +113,11 @@ export const createOrder = async (req, res) => {
     const xVerify = sha256 + "###" + SALT_INDEX;
 
     // Call PhonePe API
+    console.log('📞 Calling PhonePe API:', `${HOST_URL}/pg/v1/pay`);
+    console.log('📦 Payload:', JSON.stringify(payload, null, 2));
+    console.log('🔐 X-VERIFY Header:', xVerify);
+    console.log('🔑 Merchant ID:', MERCHANT_ID);
+
     const response = await axios.post(
       `${HOST_URL}/pg/v1/pay`,
       { request: base64EncodedPayload },
@@ -122,6 +129,8 @@ export const createOrder = async (req, res) => {
         },
       }
     );
+
+    console.log('✅ PhonePe Response:', response.data);
 
     if (response.data.success) {
       // Send Redirect URL to Frontend
@@ -141,18 +150,44 @@ export const createOrder = async (req, res) => {
     }
 
   } catch (error) {
-    console.error("Payment Error:", error.message);
+    console.error("❌ Payment Error:", error.message);
+    console.error("📍 Request URL:", `${HOST_URL}/pg/v1/pay`);
+    console.error("📦 Response Status:", error.response?.status);
+    console.error("📄 Response Data:", JSON.stringify(error.response?.data, null, 2));
+    console.error("🔍 Full Error:", error.response?.statusText);
 
     // Clean up ticket on error
-    if (error.merchantTransactionId) {
-      await Ticket.findOneAndDelete({ orderId: error.merchantTransactionId });
+    try {
+      if (merchantTransactionId) {
+        await Ticket.findOneAndDelete({ orderId: merchantTransactionId });
+        console.log('🗑️ Cleaned up failed ticket:', merchantTransactionId);
+      }
+    } catch (cleanupError) {
+      console.error('Failed to cleanup ticket:', cleanupError.message);
     }
 
-    // Provide specific error messages
-    const errorMessage = error.response?.data?.message || error.message || "Payment initialization failed";
-    res.status(500).json({
+    // Provide specific error messages based on status code
+    let errorMessage = "Payment initialization failed";
+    let statusCode = 500;
+
+    if (error.response?.status === 404) {
+      errorMessage = "Payment gateway endpoint not found. Please check PhonePe configuration.";
+      statusCode = 503;
+    } else if (error.response?.status === 400) {
+      errorMessage = error.response?.data?.message || "Invalid payment request. Please check credentials.";
+      statusCode = 400;
+    } else if (error.response?.status === 401 || error.response?.status === 403) {
+      errorMessage = "Authentication failed. Please verify PhonePe merchant credentials.";
+      statusCode = 503;
+    } else {
+      errorMessage = error.response?.data?.message || error.message || "Payment initialization failed";
+    }
+
+    res.status(statusCode).json({
       success: false,
-      message: errorMessage
+      message: errorMessage,
+      code: error.response?.data?.code,
+      details: process.env.NODE_ENV === 'development' ? error.response?.data : undefined
     });
   }
 };

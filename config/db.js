@@ -8,11 +8,11 @@ const connectDB = async () => {
     return;
   }
 
-  const uri = process.env.MONGODB_URI;
+  const uri = process.env.MONGO_URI;
 
   if (!uri) {
     // THROW error instead of exiting so server.js can catch it
-    throw new Error("❌ MONGODB_URI missing in .env");
+    throw new Error("❌ MONGO_URI missing in .env");
   }
 
   try {
